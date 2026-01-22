@@ -2,8 +2,8 @@ name: Cancer Data Monitor
 
 on:
   schedule:
-    # 매주 월요일 09:00 UTC (18:00 KST)에 실행
-    - cron: '0 0 * * 1'
+    # 30분 간격으로 실행
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -22,15 +22,26 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests beautifulsoup4 pandas
+        pip install requests
     
     - name: Run Cancer Data Monitor
-      run: python Dev/CancerDataMonitor.py
+      run: python CancerDataMonitor.py
     
     - name: Commit and push changes
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
-        git add data/
-        git commit -m "Update cancer data $(date +'%Y-%m-%d')"
+
+        # 변경사항이 있으면 커밋
+        git add period_config.json
+        git commit -m "Update cancer data period $(date +'%Y-%m-%d %H:%M')" || echo "No data changes to commit"
+
+        # Self Keep Alive: 매주 일요일 00:00 UTC 경에 dummy 파일 업데이트
+        # (30분 간격으로 실행되므로 00:00~00:30 사이에 한 번 실행됨)
+        if [ "$(date +%u)" = "7" ] && [ "$(date +%H)" = "00" ] && [ "$(date +%M)" -lt "30" ]; then
+          echo "Keep alive at $(date)" > keep_alive.txt
+          git add keep_alive.txt
+          git commit -m "Keep alive commit" || echo "Keep alive already updated"
+        fi
+
         git push
