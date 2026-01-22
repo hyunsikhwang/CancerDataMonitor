@@ -9,6 +9,9 @@ Cancer Data Monitor
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
+import urllib3
+import re
+from urllib.parse import quote
 import logging
 from datetime import datetime
 import os
@@ -25,6 +28,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# SSL 경고 비활성화
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 def fetch_cancer_data():
     """
@@ -33,33 +39,102 @@ def fetch_cancer_data():
     url = "https://kosis.kr/common/meta_onedepth.jsp?vwcd=MT_OTITLE&listid=117_11744"
     
     try:
-        # 웹 페이지 요청
-        response = requests.get(url, timeout=10)
+        session = requests.Session()
+        session.verify = False
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Referer": "https://kosis.kr/"
+        })
+
+        # 1. AJAX를 통한 수록기간 추출 시도
+        tree_url = "https://kosis.kr/statisticsList/selectTreeData.do"
+        params = {
+            "vwcd": "MT_OTITLE",
+            "parentId": "117_11744",
+            "type": "undefined"
+        }
+
+        current_period = None
+        try:
+            # orgId를 명시적으로 추가하여 시도
+            params["orgId"] = "117"
+            res = session.post(tree_url, data=params, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                tree_list = data.get('resultTreeList', [])
+                for item in tree_list:
+                    prd_info = item.get('prdInfo', '')
+                    if prd_info and prd_info.strip() and prd_info.strip() != "~":
+                        current_period = prd_info.strip()
+                        logger.info(f"AJAX를 통해 수록기간 발견: {current_period}")
+                        break
+        except Exception as e:
+            logger.warning(f"AJAX 수록기간 추출 실패: {e}")
+
+        # 2. 웹 페이지 직접 요청 (스크래핑용)
+        response = session.get(url, timeout=10)
         response.raise_for_status()
         
         # BeautifulSoup을 사용하여 HTML 파싱
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 수록기간 추출 (사이트 구조에 따라 조정 필요)
-        # 예시: 수록기간이 포함된 요소 찾기
-        period_element = soup.find('div', class_='period-info')
-        if not period_element:
-            period_element = soup.find('span', class_='data-period')
-        
-        if period_element:
-            current_period = period_element.get_text(strip=True)
+        # 수록기간이 여전히 없다면 HTML에서 검색
+        if not current_period:
+            period_element = soup.find('div', class_='period-info')
+            if not period_element:
+                period_element = soup.find('span', class_='data-period')
+
+            if period_element:
+                current_period = period_element.get_text(strip=True)
+                logger.info(f"HTML을 통해 수록기간 발견: {current_period}")
+            else:
+                # 더 넓은 범위의 텍스트 검색 (정규표현식 활용 가능)
+                period_match = re.search(r'\d{4}\s*~\s*\d{4}', response.text)
+                if period_match:
+                    current_period = period_match.group()
+                    logger.info(f"정규표현식을 통해 수록기간 발견: {current_period}")
+
+        # 3. 추가 시도: selectStatisticsInfo.do 호출 (목록 정보)
+        if not current_period:
+            try:
+                info_url = "https://kosis.kr/statisticsList/selectStatisticsInfo.do"
+                info_params = {
+                    "division": "list",
+                    "vwCd": "MT_OTITLE",
+                    "id": "117_11744",
+                    "lvl": "2"
+                }
+                res = session.post(info_url, data=info_params, timeout=10)
+                if res.status_code == 200:
+                    info_data = res.json()
+                    desc = info_data.get('resultListDesc', '')
+                    # desc HTML 내에서 수록기간 혹은 유사한 텍스트 찾기
+                    if desc:
+                        info_soup = BeautifulSoup(desc, 'html.parser')
+                        # 테이블 내의 텍스트 확인
+                        for th in info_soup.find_all('th'):
+                            if '기간' in th.get_text() or '시점' in th.get_text():
+                                td = th.find_next_sibling('td')
+                                if td:
+                                    current_period = td.get_text(strip=True)
+                                    logger.info(f"목록 정보를 통해 수록기간 발견: {current_period}")
+                                    break
+            except Exception as e:
+                logger.warning(f"목록 정보 추출 실패: {e}")
+
+        if current_period:
             logger.info(f"현재 수록기간: {current_period}")
         else:
-            current_period = None
-            logger.warning("수록기간을 찾을 수 없습니다.")
+            # 최종 수단: 이전 수록기간이 있으면 그것을 유지하거나, 알 수 없음으로 표시
+            logger.warning("수록기간을 찾을 수 없습니다. 사이트 구조가 변경되었을 수 있습니다.")
         
         # 데이터 추출 로직 (사이트 구조에 따라 조정 필요)
-        # 예시: 테이블 데이터 추출
         tables = soup.find_all('table')
         
         if not tables:
-            logger.warning("테이블을 찾을 수 없습니다.")
-            return None, current_period
+            logger.warning("HTML 내에서 테이블을 찾을 수 없습니다. (동적 로딩 가능성)")
+            # 테이블이 없더라도 수록기간만 있으면 모니터링은 가능하므로 빈 데이터프레임 반환
+            return pd.DataFrame(), current_period
         
         # 첫 번째 테이블을 데이터프레임으로 변환
         df = pd.read_html(str(tables[0]))[0]
@@ -118,15 +193,17 @@ def send_ntfy_notification(message):
     ntfy_url = f"https://ntfy.sh/{ntfy_topic}"
     
     try:
+        # ntfy.sh 헤더에는 아스키 문자만 권장되므로 제목은 영문으로 설정
         response = requests.post(
             ntfy_url,
             data=message.encode('utf-8'),
             headers={
-                'Title': '암 데이터 수록기간 변경 알림',
+                'Title': 'Cancer Data Period Updated',
                 'Tags': 'warning,chart_with_upwards_trend',
                 'Priority': 'high'
             },
-            timeout=10
+            timeout=10,
+            verify=False
         )
         response.raise_for_status()
         logger.info("ntfy.sh로 알림 전송 성공")
