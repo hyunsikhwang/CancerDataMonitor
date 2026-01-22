@@ -80,15 +80,37 @@ def fetch_cancer_data():
         
         # 수록기간이 여전히 없다면 HTML에서 검색
         if not current_period:
+            # 1. img alt="수록기간" 태그 확인
+            img_element = soup.find('img', alt='수록기간')
+            if img_element:
+                # 이미지 부모 요소(보통 a 태그)의 텍스트에서 추출
+                parent_text = img_element.parent.get_text(strip=True)
+                period_match = re.search(r'(\d{4}\s*~\s*\d{4})', parent_text)
+                if period_match:
+                    current_period = period_match.group(1)
+                    logger.info(f"HTML img 태그를 통해 수록기간 발견: {current_period}")
+
+        if not current_period:
+            # 2. title 속성에서 (년 1999~2022) 형태 확인
+            for a_tag in soup.find_all('a', title=True):
+                title_text = a_tag['title']
+                title_match = re.search(r'\(년\s*(\d{4}\s*~\s*\d{4})\)', title_text)
+                if title_match:
+                    current_period = title_match.group(1)
+                    logger.info(f"HTML a 태그 title을 통해 수록기간 발견: {current_period}")
+                    break
+
+        if not current_period:
+            # 3. 기존 방식: 특정 클래스 확인
             period_element = soup.find('div', class_='period-info')
             if not period_element:
                 period_element = soup.find('span', class_='data-period')
 
             if period_element:
                 current_period = period_element.get_text(strip=True)
-                logger.info(f"HTML을 통해 수록기간 발견: {current_period}")
+                logger.info(f"HTML 클래스를 통해 수록기간 발견: {current_period}")
             else:
-                # 더 넓은 범위의 텍스트 검색 (정규표현식 활용 가능)
+                # 더 넓은 범위의 텍스트 검색
                 period_match = re.search(r'\d{4}\s*~\s*\d{4}', response.text)
                 if period_match:
                     current_period = period_match.group()
