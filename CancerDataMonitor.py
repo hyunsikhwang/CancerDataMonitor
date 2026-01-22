@@ -7,15 +7,12 @@ Cancer Data Monitor
 """
 
 import requests
-from bs4 import BeautifulSoup
-import pandas as pd
 import urllib3
 import re
-from urllib.parse import quote
 import logging
-from datetime import datetime
 import os
 import json
+from lxml import html
 
 # 로깅 설정
 logging.basicConfig(
@@ -34,150 +31,44 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def fetch_cancer_data():
     """
-    KOSIS 사이트에서 암 데이터 가져오기
+    KOSIS 사이트에서 암 데이터 수록기간 가져오기
     """
     url = "https://kosis.kr/common/meta_onedepth.jsp?vwcd=MT_OTITLE&listid=117_11744"
     
     try:
-        session = requests.Session()
-        session.verify = False
-        session.headers.update({
+        headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Referer": "https://kosis.kr/"
-        })
-
-        # 1. AJAX를 통한 수록기간 추출 시도
-        tree_url = "https://kosis.kr/statisticsList/selectTreeData.do"
-        params = {
-            "vwcd": "MT_OTITLE",
-            "parentId": "117_11744",
-            "type": "undefined"
         }
 
-        current_period = None
-        try:
-            # orgId를 명시적으로 추가하여 시도
-            params["orgId"] = "117"
-            res = session.post(tree_url, data=params, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                tree_list = data.get('resultTreeList', [])
-                for item in tree_list:
-                    prd_info = item.get('prdInfo', '')
-                    if prd_info and prd_info.strip() and prd_info.strip() != "~":
-                        current_period = prd_info.strip()
-                        logger.info(f"AJAX를 통해 수록기간 발견: {current_period}")
-                        break
-        except Exception as e:
-            logger.warning(f"AJAX 수록기간 추출 실패: {e}")
-
-        # 2. 웹 페이지 직접 요청 (스크래핑용)
-        response = session.get(url, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10, verify=False)
         response.raise_for_status()
         
-        # BeautifulSoup을 사용하여 HTML 파싱
-        soup = BeautifulSoup(response.text, 'html.parser')
+        # lxml을 사용하여 XPath로 데이터 추출
+        tree = html.fromstring(response.text)
+        xpath = '//*[@id="117_11744.2"]/ul/li[7]/a'
+        elements = tree.xpath(xpath)
         
-        # 수록기간이 여전히 없다면 HTML에서 검색
-        if not current_period:
-            # 1. img alt="수록기간" 태그 확인
-            img_element = soup.find('img', alt='수록기간')
-            if img_element:
-                # 이미지 부모 요소(보통 a 태그)의 텍스트에서 추출
-                parent_text = img_element.parent.get_text(strip=True)
-                period_match = re.search(r'(\d{4}\s*~\s*\d{4})', parent_text)
-                if period_match:
-                    current_period = period_match.group(1)
-                    logger.info(f"HTML img 태그를 통해 수록기간 발견: {current_period}")
-
-        if not current_period:
-            # 2. title 속성에서 (년 1999~2022) 형태 확인
-            for a_tag in soup.find_all('a', title=True):
-                title_text = a_tag['title']
-                title_match = re.search(r'\(년\s*(\d{4}\s*~\s*\d{4})\)', title_text)
-                if title_match:
-                    current_period = title_match.group(1)
-                    logger.info(f"HTML a 태그 title을 통해 수록기간 발견: {current_period}")
-                    break
-
-        if not current_period:
-            # 3. 기존 방식: 특정 클래스 확인
-            period_element = soup.find('div', class_='period-info')
-            if not period_element:
-                period_element = soup.find('span', class_='data-period')
-
-            if period_element:
-                current_period = period_element.get_text(strip=True)
-                logger.info(f"HTML 클래스를 통해 수록기간 발견: {current_period}")
-            else:
-                # 더 넓은 범위의 텍스트 검색
-                period_match = re.search(r'\d{4}\s*~\s*\d{4}', response.text)
-                if period_match:
-                    current_period = period_match.group()
-                    logger.info(f"정규표현식을 통해 수록기간 발견: {current_period}")
-
-        # 3. 추가 시도: selectStatisticsInfo.do 호출 (목록 정보)
-        if not current_period:
-            try:
-                info_url = "https://kosis.kr/statisticsList/selectStatisticsInfo.do"
-                info_params = {
-                    "division": "list",
-                    "vwCd": "MT_OTITLE",
-                    "id": "117_11744",
-                    "lvl": "2"
-                }
-                res = session.post(info_url, data=info_params, timeout=10)
-                if res.status_code == 200:
-                    info_data = res.json()
-                    desc = info_data.get('resultListDesc', '')
-                    # desc HTML 내에서 수록기간 혹은 유사한 텍스트 찾기
-                    if desc:
-                        info_soup = BeautifulSoup(desc, 'html.parser')
-                        # 테이블 내의 텍스트 확인
-                        for th in info_soup.find_all('th'):
-                            if '기간' in th.get_text() or '시점' in th.get_text():
-                                td = th.find_next_sibling('td')
-                                if td:
-                                    current_period = td.get_text(strip=True)
-                                    logger.info(f"목록 정보를 통해 수록기간 발견: {current_period}")
-                                    break
-            except Exception as e:
-                logger.warning(f"목록 정보 추출 실패: {e}")
-
-        if current_period:
-            logger.info(f"현재 수록기간: {current_period}")
+        current_period = None
+        if elements:
+            current_period = elements[0].text_content().strip()
+            logger.info(f"XPath를 통해 수록기간 발견: {current_period}")
         else:
-            # 최종 수단: 이전 수록기간이 있으면 그것을 유지하거나, 알 수 없음으로 표시
-            logger.warning("수록기간을 찾을 수 없습니다. 사이트 구조가 변경되었을 수 있습니다.")
-        
-        # 데이터 추출 로직 (사이트 구조에 따라 조정 필요)
-        tables = soup.find_all('table')
-        
-        if not tables:
-            logger.warning("HTML 내에서 테이블을 찾을 수 없습니다. (동적 로딩 가능성)")
-            # 테이블이 없더라도 수록기간만 있으면 모니터링은 가능하므로 빈 데이터프레임 반환
-            return pd.DataFrame(), current_period
-        
-        # 첫 번째 테이블을 데이터프레임으로 변환
-        df = pd.read_html(str(tables[0]))[0]
-        
-        # 데이터 저장
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = "data"
-        os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f"cancer_data_{timestamp}.csv")
-        
-        df.to_csv(output_file, index=False, encoding='utf-8-sig')
-        logger.info(f"데이터가 성공적으로 저장되었습니다: {output_file}")
-        
-        return df, current_period
+            logger.warning(f"XPath '{xpath}'로 수록기간을 찾을 수 없습니다.")
+            # 만약 XPath로 못찾는다면, 텍스트에서 직접 찾기 시도 (보험용)
+            period_match = re.search(r'(\d{4}\s*~\s*\d{4})', response.text)
+            if period_match:
+                current_period = period_match.group(1)
+                logger.info(f"정규표현식을 통해 수록기간 발견: {current_period}")
+
+        return current_period
         
     except requests.exceptions.RequestException as e:
         logger.error(f"데이터 가져오기 실패: {e}")
-        return None, None
+        return None
     except Exception as e:
         logger.error(f"예상치 못한 오류: {e}")
-        return None, None
+        return None
 
 
 def check_period_change(current_period):
@@ -240,21 +131,19 @@ def main():
     메인 함수
     """
     logger.info("암 데이터 모니터링 시작")
-    data, current_period = fetch_cancer_data()
+    current_period = fetch_cancer_data()
     
-    if data is not None:
-        logger.info("데이터 가져오기 성공")
-        logger.info(f"데이터 크기: {data.shape}")
-        
+    if current_period:
         # 수록기간 변경 감지
-        if current_period:
-            period_changed, _ = check_period_change(current_period)
-            
-            if period_changed:
-                message = f"암 데이터 수록기간이 변경되었습니다: {current_period}"
-                send_ntfy_notification(message)
+        period_changed, _ = check_period_change(current_period)
+
+        if period_changed:
+            message = f"암 데이터 수록기간이 변경되었습니다: {current_period}"
+            send_ntfy_notification(message)
+        else:
+            logger.info("수록기간 변경 없음")
     else:
-        logger.error("데이터 가져오기 실패")
+        logger.error("수록기간 정보를 가져오는 데 실패했습니다.")
     
     logger.info("암 데이터 모니터링 완료")
 
